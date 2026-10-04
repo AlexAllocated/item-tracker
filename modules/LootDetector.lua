@@ -75,6 +75,57 @@ local function PassesQualityThreshold(quality, isGroupLoot)
     return quality and quality >= threshold
 end
 
+local pendingItems = {}
+local retryScheduled = false
+local ITEM_INFO_TIMEOUT = 60
+
+local function PublishLoot(entry, quality, icon)
+    entry.quality, entry.icon = quality, icon or entry.icon
+    if IT.db.settings.enabled and PassesQualityThreshold(quality, entry.isGroupLoot) then
+        IT.Events:Fire("ITEM_LOOTED", entry)
+    end
+end
+
+local function ResolvePendingItem(itemID)
+    local pending = pendingItems[itemID]
+    if not pending then return end
+    local _, _, quality, _, _, _, _, _, _, icon = GetItemInfo(itemID)
+    -- Detach before publishing: subscribers can fire other loot events.
+    pendingItems[itemID] = nil
+    for _, request in ipairs(pending) do
+        if quality ~= nil then
+            PublishLoot(request.entry, quality, icon)
+        elseif GetTime() < request.expires then
+            pendingItems[itemID] = pendingItems[itemID] or {}
+            table.insert(pendingItems[itemID], request)
+        else
+            IT:Debug("Item information timed out: " .. itemID)
+        end
+    end
+end
+
+local function ScheduleItemRetry()
+    if retryScheduled or not next(pendingItems) then return end
+    retryScheduled = true
+    C_Timer.After(2, function()
+        retryScheduled = false
+        local ids = {}
+        for itemID in pairs(pendingItems) do ids[#ids + 1] = itemID end
+        for _, itemID in ipairs(ids) do ResolvePendingItem(itemID) end
+        ScheduleItemRetry()
+    end)
+end
+
+local function ProcessLoot(entry, quality)
+    if quality ~= nil then
+        PublishLoot(entry, quality, entry.icon)
+        return
+    end
+    pendingItems[entry.itemID] = pendingItems[entry.itemID] or {}
+    table.insert(pendingItems[entry.itemID], { entry = entry, expires = GetTime() + ITEM_INFO_TIMEOUT })
+    ScheduleItemRetry()
+end
+
 -- ============================================================================
 -- Shared Self-Item Processing
 -- Fires ITEM_VALUE for EVERY self-received item (the "show everything" stream
@@ -105,10 +156,7 @@ local function ProcessSelfItem(link, count, quality, icon)
     -- the history quality threshold.
     IT.Events:Fire("ITEM_VALUE", entry)
 
-    if not PassesQualityThreshold(quality, isGroupLoot) then return end
-
-    IT:Debug("Self item detected: " .. link .. " x" .. entry.count)
-    IT.Events:Fire("ITEM_LOOTED", entry)
+    ProcessLoot(entry, quality)
 end
 
 -- ============================================================================
@@ -207,10 +255,7 @@ local function OnChatMsgLoot(msg)
         IT.Events:Fire("ITEM_VALUE", entry)
     end
 
-    if not PassesQualityThreshold(quality, isGroupLoot) then return end
-
-    IT:Debug("Loot detected: " .. itemLink .. " x" .. entry.count .. " by " .. player)
-    IT.Events:Fire("ITEM_LOOTED", entry)
+    ProcessLoot(entry, quality)
 end
 
 -- ============================================================================
@@ -330,6 +375,9 @@ end
 -- ============================================================================
 
 function Detector:Initialize()
+    IT:RegisterEvent("GET_ITEM_INFO_RECEIVED", function(itemID, success)
+        if success ~= false then ResolvePendingItem(itemID) end
+    end)
     IT:RegisterEvent("CHAT_MSG_LOOT", OnChatMsgLoot)
     IT:RegisterEvent("CHAT_MSG_MONEY", OnChatMsgMoney)
     IT:RegisterEvent("QUEST_TURNED_IN", OnQuestTurnedIn)

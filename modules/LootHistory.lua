@@ -20,6 +20,11 @@ IT.LootHistory = History
 -- ============================================================================
 
 local history  -- reference to IT.db.history (set during Initialize)
+-- Only pair notifications from this session. Weak keys release state when
+-- history entries are trimmed and when a provider discards a finished roll.
+local pendingLoot = setmetatable({}, { __mode = "k" })
+local pendingAwards = setmetatable({}, { __mode = "k" })
+local handledRolls = setmetatable({}, { __mode = "k" })
 
 -- ============================================================================
 -- History Entry Structure
@@ -35,7 +40,7 @@ local history  -- reference to IT.db.history (set during Initialize)
         player      = string,       -- who received the item
         isSelf      = boolean,
         isGroupLoot = boolean,
-        timestamp   = number,       -- GetTime()
+        timestamp   = number,       -- time() (persists across reloads)
         wasRolled   = boolean,
         rolls       = { { player, rollType, number }, ... } | nil,
         winner      = string | nil,
@@ -61,6 +66,8 @@ end
 
 function History:Clear()
     wipe(history)
+    wipe(pendingLoot)
+    wipe(pendingAwards)
     IT.Events:Fire("HISTORY_UPDATED")
 end
 
@@ -77,21 +84,40 @@ function History:GetEntry(index)
 end
 
 -- ============================================================================
--- Find an existing entry by itemID + player within a time window.
--- Used to annotate loot entries with roll results.
+-- Find an existing entry by itemID within a time window.
 -- ============================================================================
 
 local MATCH_WINDOW = 30  -- seconds
 
 function History:FindRecentByItem(itemID, maxAge)
     maxAge = maxAge or MATCH_WINDOW
-    local now = GetTime()
+    local now = time()
     for i, entry in ipairs(history) do
-        if entry.itemID == itemID and (now - entry.timestamp) < maxAge then
+        if entry.itemID == itemID and type(entry.timestamp) == "number"
+            and now >= entry.timestamp and now - entry.timestamp < maxAge then
             return i, entry
         end
     end
     return nil, nil
+end
+
+local function PlayerKey(name)
+    if not name or name == "" then return nil end
+    local player, realm = name:match("^([^%-]+)%-(.+)$")
+    if not player then player, realm = name, GetRealmName and GetRealmName() or "" end
+    return player:lower() .. "-" .. realm:gsub("%s", ""):lower()
+end
+
+local function Matches(entry, other, pending)
+    if not pending or entry.itemID ~= other.itemID
+        or not PlayerKey(entry.player) or PlayerKey(entry.player) ~= PlayerKey(other.player) then
+        return false
+    end
+    -- Cache loading may delay ITEM_LOOTED. Match either the original receipt
+    -- time or the event delivery time (RCLC's fallback awards during delivery).
+    return GetTime() - pending.at < MATCH_WINDOW
+        or (type(entry.timestamp) == "number" and type(other.timestamp) == "number"
+            and math.abs(entry.timestamp - other.timestamp) < MATCH_WINDOW)
 end
 
 -- ============================================================================
@@ -99,51 +125,82 @@ end
 -- ============================================================================
 
 local function OnItemLooted(lootEntry)
-    -- Don't double-add items that are (or were recently) part of a roll.
-    -- ROLL_ENDED handles those. Include finished rolls still in the active
-    -- table (cleaned up after 2 s) to prevent duplicate entries.
-    if lootEntry.isGroupLoot then
-        local activeRolls = IT.RollTracker and IT.RollTracker:GetActiveRolls()
-        if activeRolls then
-            for _, rollData in pairs(activeRolls) do
-                if rollData.itemID == lootEntry.itemID then
-                    return  -- skip; ROLL_ENDED handles it
-                end
+    local remaining = lootEntry.count or 1
+    -- Match oldest first and consume quantities, so two copies awarded to
+    -- the same player remain two awards instead of swallowing the second.
+    for i = #history, 1, -1 do
+        local entry = history[i]
+        local pending = pendingAwards[entry]
+        if Matches(entry, lootEntry, pending) then
+            local used = math.min(remaining, pending.remaining)
+            remaining, pending.remaining = remaining - used, pending.remaining - used
+            entry.itemLink = lootEntry.itemLink or entry.itemLink
+            entry.quality = lootEntry.quality or entry.quality
+            entry.icon = lootEntry.icon or entry.icon
+            if pending.remaining == 0 then pendingAwards[entry] = nil end
+            if remaining == 0 then
+                IT.Events:Fire("HISTORY_UPDATED")
+                return
             end
         end
     end
 
-    History:Add({
+    local entry = {
         itemLink    = lootEntry.itemLink,
         itemID      = lootEntry.itemID,
         quality     = lootEntry.quality,
-        count       = lootEntry.count,
+        count       = remaining,
         icon        = lootEntry.icon,
         player      = lootEntry.player,
         isSelf      = lootEntry.isSelf,
         isGroupLoot = lootEntry.isGroupLoot,
-        timestamp   = lootEntry.timestamp,
+        timestamp   = lootEntry.timestamp or time(),
         wasRolled   = false,
         rolls       = nil,
         winner      = nil,
-    })
+    }
+    pendingLoot[entry] = { at = GetTime() }
+    History:Add(entry)
 end
 
 local function OnRollEnded(rollData)
-    History:Add({
+    if handledRolls[rollData] then return end
+    handledRolls[rollData] = true
+    local entry = {
         itemLink    = rollData.itemLink,
         itemID      = rollData.itemID,
         quality     = rollData.quality,
         count       = rollData.count or 1,
         icon        = rollData.icon,
         player      = rollData.winner or "Nobody",
-        isSelf      = (rollData.winner == UnitName("player")),
+        isSelf      = (PlayerKey(rollData.winner) == PlayerKey(UnitName("player"))),
         isGroupLoot = true,
-        timestamp   = rollData.startTime,
+        timestamp   = time(),
         wasRolled   = true,
         rolls       = rollData.rolls,
         winner      = rollData.winner,
-    })
+    }
+    local remaining = entry.count
+    for i = #history, 1, -1 do
+        local receipt = history[i]
+        if Matches(receipt, entry, pendingLoot[receipt]) then
+            local used = math.min(remaining, receipt.count)
+            if remaining == entry.count then
+                entry.timestamp = receipt.timestamp
+                entry.itemLink = receipt.itemLink or entry.itemLink
+                entry.quality = receipt.quality or entry.quality
+                entry.icon = receipt.icon or entry.icon
+            end
+            remaining, receipt.count = remaining - used, receipt.count - used
+            if receipt.count == 0 then
+                pendingLoot[receipt] = nil
+                table.remove(history, i)
+            end
+            if remaining == 0 then break end
+        end
+    end
+    if remaining > 0 then pendingAwards[entry] = { at = GetTime(), remaining = remaining } end
+    History:Add(entry)
 end
 
 -- ============================================================================
