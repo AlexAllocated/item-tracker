@@ -676,7 +676,7 @@ end
 --- the bank was open can fire 0.2s later when the bank has already closed,
 --- at which point GetContainerItemLink returns nil for bank slots and we
 --- would otherwise wipe the cache to an empty table.
-local function RescanBankToCache()
+local function RescanBankToCache(notify)
     if not IT.charDB or not GetContainerNumSlots then return end
     if not state.bankOpen then return end
 
@@ -698,12 +698,14 @@ local function RescanBankToCache()
     end
 
     IT.charDB.bankItems = cache
-    IT.Events:Fire("GEAR_GOAL_LIST_CHANGED")
+    if notify ~= false then IT.Events:Fire("GEAR_GOAL_LIST_CHANGED") end
 end
 
 --- PLAYERBANKSLOTS_CHANGED can fire dozens of times in rapid succession when
---- the bank first opens (once per slot). Coalesce into a single rescan.
-local function ScheduleBankRescan()
+--- the bank first opens. Capture changes immediately while slots are readable,
+--- then coalesce the UI refresh and a follow-up scan as the bank settles.
+local function ScheduleBankRescan(captureNow)
+    if captureNow then RescanBankToCache(false) end
     if state.bankRescanPending then return end
     state.bankRescanPending = true
     C_Timer.After(0.2, function()
@@ -959,6 +961,44 @@ local function escapeName(name)
     return (name or ""):gsub(SAFE_NAME_PATTERN, "_")
 end
 
+local function Contains(list, value)
+    for _, entry in ipairs(list) do
+        if entry == value then return true end
+    end
+    return false
+end
+
+local function PositiveInteger(value)
+    return type(value) == "number" and value > 0 and value <= 9007199254740991
+        and value == math.floor(value)
+end
+
+local function ValidateDecodedPhase(decoded)
+    if type(decoded) ~= "table" or type(decoded.slots) ~= "table" then
+        return nil, "missing slot data"
+    end
+    if not Contains(GG.PHASES, decoded.phase) then return nil, "unknown phase" end
+    for slotID, picks in pairs(decoded.slots) do
+        if not Contains(GG.SLOT_ORDER, slotID) then return nil, "unknown equipment slot" end
+        if type(picks) ~= "table" then return nil, "invalid picks for slot " .. slotID end
+        local count, last = 0, 0
+        local items, ranks = {}, {}
+        for index, pick in pairs(picks) do
+            if not PositiveInteger(index) or type(pick) ~= "table"
+                or not PositiveInteger(pick.itemID) or not PositiveInteger(pick.rank) then
+                return nil, "invalid pick for slot " .. slotID
+            end
+            if items[pick.itemID] or ranks[pick.rank] then
+                return nil, "duplicate item or rank in slot " .. slotID
+            end
+            items[pick.itemID], ranks[pick.rank] = true, true
+            count, last = count + 1, math.max(last, index)
+        end
+        if count ~= last then return nil, "missing pick in slot " .. slotID end
+    end
+    return true
+end
+
 --- Build the export string for a loadout/phase. Returns a string starting
 --- with `!GG1!` so it's easy to recognise when pasted.
 function GG:EncodePhase(loadoutID, phase)
@@ -990,53 +1030,76 @@ function GG:DecodePhase(str)
     local body = str:match("^!GG1!(.*)$")
     if not body then return nil, "missing !GG1! header" end
 
-    local name, phase, slotData = body:match("^([^!]+)!([^!]+)!?(.*)$")
+    local name, phase, slotData = body:match("^([^!]+)!([^!]+)!(.*)$")
     if not (name and phase) then return nil, "malformed header" end
 
     local result = { name = name, phase = phase, slots = {} }
-    if slotData and slotData ~= "" then
-        for slotChunk in slotData:gmatch("[^|]+") do
+    if slotData ~= "" then
+        for slotChunk in (slotData .. "|"):gmatch("(.-)|") do
             local slotID, picksStr = slotChunk:match("^(%d+)=(.+)$")
-            if slotID then
-                slotID = tonumber(slotID)
-                local picks = {}
-                for pick in picksStr:gmatch("[^,]+") do
-                    local itemID, rank = pick:match("^(%d+):(%d+)$")
-                    if itemID and rank then
-                        table.insert(picks, {
-                            itemID = tonumber(itemID),
-                            rank   = tonumber(rank),
-                        })
-                    end
-                end
-                if #picks > 0 then
-                    result.slots[slotID] = picks
-                end
+            if not slotID then return nil, "malformed slot data" end
+            slotID = tonumber(slotID)
+            if result.slots[slotID] then return nil, "duplicate slot " .. slotID end
+            local picks = {}
+            for pick in (picksStr .. ","):gmatch("(.-),") do
+                local itemID, rank = pick:match("^(%d+):(%d+)$")
+                if not itemID then return nil, "malformed pick for slot " .. slotID end
+                table.insert(picks, { itemID = tonumber(itemID), rank = tonumber(rank) })
             end
+            result.slots[slotID] = picks
         end
     end
+    local valid, reason = ValidateDecodedPhase(result)
+    if not valid then return nil, reason end
     return result
 end
 
 --- Apply a decoded phase blob to a loadout/phase.
---- mode: "merge" (skip duplicates, keep existing) or "overwrite" (clear first).
+--- mode: "merge" (skip duplicates, keep existing) or "overwrite" (replace).
 --- Returns: ok, added, skipped (or nil + reason).
 function GG:ApplyDecodedPhase(loadoutID, phase, decoded, mode)
-    if not loadoutID or not phase or type(decoded) ~= "table" then
-        return nil, "missing argument"
-    end
-    if mode == "overwrite" then
-        if not IT.charDB.goals then IT.charDB.goals = {} end
-        if not IT.charDB.goals[loadoutID] then IT.charDB.goals[loadoutID] = {} end
-        IT.charDB.goals[loadoutID][phase] = {}
-    end
-    local added, skipped = 0, 0
-    for slotID, picks in pairs(decoded.slots or {}) do
-        for _, p in ipairs(picks) do
-            local entry = self:AddGoal(loadoutID, phase, slotID, p.itemID, { rank = p.rank })
-            if entry then added = added + 1 else skipped = skipped + 1 end
+    local valid, reason = ValidateDecodedPhase(decoded)
+    if not valid then return nil, reason end
+    if not self:GetLoadoutByID(loadoutID) then return nil, "loadout not found" end
+    if not Contains(GG.PHASES, phase) then return nil, "unknown destination phase" end
+    mode = mode or "merge"
+    if mode ~= "merge" and mode ~= "overwrite" then return nil, "unknown import mode" end
+
+    -- Prepare the entire replacement before changing saved goals or notifying
+    -- listeners. A failed import must leave the original phase intact.
+    local replacement = {}
+    local existing = IT.charDB.goals and IT.charDB.goals[loadoutID]
+    if mode == "merge" then
+        for slotID, goals in pairs(existing and existing[phase] or {}) do
+            local list = {}
+            for _, goal in ipairs(goals) do
+                local copy = {}
+                for key, value in pairs(goal) do copy[key] = value end
+                list[#list + 1] = copy
+            end
+            replacement[slotID] = list
         end
     end
+    local added, skipped = 0, 0
+    for slotID, picks in pairs(decoded.slots) do
+        local list = replacement[slotID] or {}
+        replacement[slotID] = list
+        local seen, ordered = {}, {}
+        for _, goal in ipairs(list) do seen[goal.itemID] = true end
+        for _, pick in ipairs(picks) do ordered[#ordered + 1] = pick end
+        table.sort(ordered, function(a, b) return a.rank < b.rank end)
+        for _, pick in ipairs(ordered) do
+            if seen[pick.itemID] then
+                skipped = skipped + 1
+            else
+                list[#list + 1] = { itemID = pick.itemID, rank = #list + 1, obtained = false }
+                seen[pick.itemID] = true
+                added = added + 1
+            end
+        end
+        self:NormalizeRanks(list)
+    end
+    ensureSpecBucket(loadoutID)[phase] = replacement
     IT.Events:Fire("GEAR_GOAL_LIST_CHANGED", {
         loadoutID = loadoutID, phase = phase, reason = "imported",
     })
@@ -1151,7 +1214,7 @@ function GG:Initialize()
         IT.Events:Fire("GEAR_GOAL_LIST_CHANGED")  -- repaint without the live-bank fallback
     end)
     IT:RegisterEvent("PLAYERBANKSLOTS_CHANGED", function()
-        if state.bankOpen then ScheduleBankRescan() end
+        if state.bankOpen then ScheduleBankRescan(true) end
     end)
     -- BAG_UPDATE fires for both carried bags (which we don't care about for
     -- the bank cache) and bank bags (which we do, but only while the bank UI
@@ -1159,10 +1222,10 @@ function GG:Initialize()
     -- backpack change.
     IT:RegisterEvent("BAG_UPDATE", function(bag)
         if not state.bankOpen then return end
-        if bag == (BANK_CONTAINER or -1) then ScheduleBankRescan(); return end
+        if bag == (BANK_CONTAINER or -1) then ScheduleBankRescan(true); return end
         local first = (NUM_BAG_SLOTS or 4) + 1
         local last  = (NUM_BAG_SLOTS or 4) + (NUM_BANKBAGSLOTS or 7)
-        if bag >= first and bag <= last then ScheduleBankRescan() end
+        if bag >= first and bag <= last then ScheduleBankRescan(true) end
     end)
 
     IT:Debug("GearGoals initialized")
