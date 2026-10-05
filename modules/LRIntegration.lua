@@ -33,6 +33,12 @@ local activeRolls = {}    -- itemID → rollData
 local reserves = {}       -- itemID → { "Player1", "Player2", ... }
 local rollCounter = 0
 
+local function TrackingEnabled()
+    if IT.db.settings.enabled then return true end
+    wipe(activeRolls)
+    return false
+end
+
 -- ============================================================================
 -- Helpers
 -- ============================================================================
@@ -72,6 +78,7 @@ end
 local MAX_ITEM_RETRIES = 5
 
 local function OnRequestRoll(item, players, retries)
+    if not TrackingEnabled() then return end
     if not item then return end
     retries = retries or 0
 
@@ -134,6 +141,7 @@ end
 -- ============================================================================
 
 local function OnSendWinner(item, winners, losers, roll)
+    if not TrackingEnabled() then return end
     if not item then return end
 
     local itemID
@@ -194,7 +202,7 @@ local function OnSendWinner(item, winners, losers, roll)
     IT.Events:Fire("ROLL_ENDED", rollData)
 
     C_Timer.After(2, function()
-        activeRolls[itemID] = nil
+        if activeRolls[itemID] == rollData then activeRolls[itemID] = nil end
     end)
 end
 

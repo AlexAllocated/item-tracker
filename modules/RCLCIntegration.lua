@@ -30,6 +30,12 @@ local RC_ADDON_NAMES = { "RCLootCouncil_Classic", "RCLootCouncil" }
 local hooked = false
 local activeSessions = {}  -- session → rollData
 
+local function TrackingEnabled()
+    if IT.db.settings.enabled then return true end
+    wipe(activeSessions)
+    return false
+end
+
 -- ============================================================================
 -- Helpers
 -- ============================================================================
@@ -63,6 +69,7 @@ end
 -- ============================================================================
 
 local function OnLootTableReceived(rc)
+    if not TrackingEnabled() then return end
     -- rc.enabled is false when RCLC is disabled → ignore early-return calls
     if not rc.enabled then return end
     local lt = rc:GetLootTable()
@@ -112,6 +119,7 @@ local RCLC_RESPONSE_MAP = {
 }
 
 local function OnResponseReceived(rc, name, session, data)
+    if not TrackingEnabled() then return end
     local rollData = activeSessions[session]
     if not rollData or rollData.finished then return end
 
@@ -151,6 +159,7 @@ end
 -- ============================================================================
 
 local function FinishSession(session, winner, source)
+    if not TrackingEnabled() then return end
     local rollData = activeSessions[session]
     if not rollData or rollData.finished then return end
 
@@ -161,7 +170,7 @@ local function FinishSession(session, winner, source)
     IT.Events:Fire("ROLL_ENDED", rollData)
 
     C_Timer.After(2, function()
-        activeSessions[session] = nil
+        if activeSessions[session] == rollData then activeSessions[session] = nil end
     end)
 end
 
@@ -186,6 +195,7 @@ local POLL_INTERVAL    = 2    -- seconds between checks
 local MAX_SESSION_AGE  = 180  -- seconds; auto-finish after this regardless
 
 local function PollActiveSessions()
+    if not TrackingEnabled() then return end
     if not next(activeSessions) then return end
 
     local RC = GetRC()
@@ -270,6 +280,7 @@ local function InstallHooks()
     -- Clean up when session ends
     if RC.RegisterMessage then
         RC:RegisterMessage("RCSessionEnd", function()
+            if not TrackingEnabled() then return end
             -- Finish any unfinished sessions
             for session, rollData in pairs(activeSessions) do
                 if not rollData.finished then
